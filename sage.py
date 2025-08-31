@@ -805,3 +805,139 @@ class SAGE:
                 result_df[col] = pd.NA
                 
         return result_df[self.feature_columns]
+
+    def imputation(self, csv_file_path, target_column, \
+                   max_new_tokens_per_value=20, temperature=1.0, \
+                   mi_threshold=0.01, apply_final_constraints=True,\
+                   save_path = '../output.csv'):
+        """
+        对指定CSV文件中的目标列进行缺失值填充。
+        
+        Args:
+            csv_file_path (str): CSV文件路径
+            target_column (str): 需要填充缺失值的列名
+            max_new_tokens_per_value (int): 每个值生成的最大token数
+            temperature (float): 生成时的温度参数
+            mi_threshold (float): 互信息阈值
+            apply_final_constraints (bool): 是否应用最终约束
+            save_path (str): 保存路径
+        Returns:
+            pd.DataFrame: 填充缺失值后的DataFrame
+        """
+        self.model.eval()
+        self.selector.eval()
+        
+        # 读取CSV文件
+        df = pd.read_csv(csv_file_path)
+        
+        # 检查目标列是否存在
+        if target_column not in df.columns:
+            raise ValueError(f"Column '{target_column}' not found in the CSV file")
+        
+        # 检查目标列是否有缺失值
+        missing_mask = df[target_column].isna()
+        if not missing_mask.any():
+            print(f"No missing values found in column '{target_column}'")
+            return df
+        
+        missing_count = missing_mask.sum()
+        print(f"Found {missing_count} missing values in column '{target_column}'")
+        
+        # 创建结果DataFrame的副本
+        result_df = df.copy()
+        
+        # 处理每个缺失值
+        for idx in tqdm(df[missing_mask].index, desc=f"Imputing missing values in {target_column}"):
+            # 获取当前行的所有非缺失值作为prefix
+            current_row = df.loc[idx]
+            available_features = []
+            
+            for col in self.feature_columns:
+                if col != target_column and pd.notna(current_row[col]):
+                    available_features.append((col, str(current_row[col])))
+            
+            if not available_features:
+                # 如果没有可用的特征值，随机选择一个训练数据中的值
+                random_value = self.df[target_column].dropna().sample(1).iloc[0]
+                result_df.loc[idx, target_column] = str(random_value)
+                continue
+            
+            # 构建prompt，使用所有可用的特征值
+            filtered_prefix_parts = []
+            if available_features:
+                # 使用selector选择最相关的特征值
+                mi_scores = self.selector(target_column, available_features)
+                if mi_scores.numel() > 0:
+                    relevant_indices = (mi_scores >= mi_threshold).nonzero(as_tuple=True)[0]
+                    for idx_score in relevant_indices:
+                        selected_feat, selected_val = available_features[idx_score.item()]
+                        filtered_prefix_parts.append(f"{selected_feat} is {selected_val}")
+            
+            # 构建生成prompt
+            current_generator_prompt_base = f"{target_column} is"
+            if filtered_prefix_parts:
+                current_prompt_for_generator = ", ".join(filtered_prefix_parts) + ", " + current_generator_prompt_base
+            else:
+                current_prompt_for_generator = current_generator_prompt_base
+            
+            # 编码输入
+            input_ids = self.tokenizer(current_prompt_for_generator, return_tensors='pt').input_ids.to(self.device)
+            
+            # 构建LogitsProcessor列表
+            logits_processor_list = LogitsProcessorList()
+            
+            # 阻止逗号作为第一个token
+            logits_processor_list.append(NoLeadingCommaLogitsProcessor(self.tokenizer))
+            
+            # 如果是分类特征，应用合法值token约束
+            if self.constrain_string_values and target_column in self.categorical_features:
+                allowed_tokens = self.valid_value_token_ids.get(target_column)
+                if allowed_tokens:
+                    try:
+                        logits_processor_list.append(AllowedTokensLogitsProcessor(allowed_tokens))
+                    except ValueError as e:
+                        print(f"Warning: Skipping AllowedTokensLogitsProcessor for '{target_column}': {e}")
+            
+            # 获取有效的最大token数
+            effective_max_new_tokens = self.max_tokens_for_value.get(target_column, max_new_tokens_per_value)
+            
+            # 生成缺失值
+            output = self.model.generate(
+                input_ids,
+                max_new_tokens=effective_max_new_tokens,
+                do_sample=True,
+                temperature=temperature,
+                top_k=50,
+                top_p=0.95,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                logits_processor=logits_processor_list if logits_processor_list else None
+            )
+            
+            # 解码生成的结果
+            full_generated_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
+            new_segment = full_generated_text[len(current_prompt_for_generator):]
+            generated_value = new_segment.split(",")[0].strip()
+            
+            # 如果生成了空值，使用随机值填充
+            if not generated_value:
+                random_value = self.df[target_column].dropna().sample(1).iloc[0]
+                generated_value = str(random_value)
+            
+            # 应用约束条件（如果需要）
+            if apply_final_constraints:
+                # 创建临时的feature_value_map用于约束检查
+                temp_map = {target_column: generated_value}
+                corrected_map = self.apply_constraints(temp_map)
+                final_value = corrected_map.get(target_column, generated_value)
+            else:
+                final_value = generated_value
+            
+            # 填充缺失值
+            result_df.loc[idx, target_column] = final_value
+        
+        print(f"Successfully imputed {missing_count} missing values in column '{target_column}'")
+    
+        sampled_df.to_csv(save_path, index=False)
+        clean_csv_in_place(save_path)
+        return result_df
