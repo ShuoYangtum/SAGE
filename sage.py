@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList
 from torch.optim import AdamW
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 from peft import get_peft_model, LoraConfig, TaskType
 from sklearn.model_selection import train_test_split
 from sklearn.feature_selection import mutual_info_classif
@@ -423,7 +423,7 @@ class SAGE:
             samples = random.sample(samples, sample_num)
         tmp_df=pd.DataFrame(samples)
         dict_list = tmp_df.to_dict(orient='records')
-        output=[generator.apply_constraints(dict_list[i]) for i in range(sample_num)]
+        output=[self.apply_constraints(dict_list[i]) for i in range(sample_num)]
         return pd.DataFrame(output)
 
     
@@ -494,7 +494,7 @@ class SAGE:
                     
                     min_val = constraint.get("min")
                     max_val = constraint.get("max")
-                    min_diff = generator.numerical_min_diffs.get(feature)
+                    min_diff = self.numerical_min_diffs.get(feature)
  
                     if min_val is not None:
                         gen_value = max(gen_value, min_val)
@@ -811,61 +811,54 @@ class SAGE:
                    mi_threshold=0.01, apply_final_constraints=True,\
                    save_path = '../output.csv'):
         """
-        对指定CSV文件中的目标列进行缺失值填充。
+        Predict values for target column in CSV file and calculate error metrics.
         
         Args:
-            csv_file_path (str): CSV文件路径
-            target_column (str): 需要填充缺失值的列名
-            max_new_tokens_per_value (int): 每个值生成的最大token数
-            temperature (float): 生成时的温度参数
-            mi_threshold (float): 互信息阈值
-            apply_final_constraints (bool): 是否应用最终约束
-            save_path (str): 保存路径
+            csv_file_path: Path to input CSV file
+            target_column: Name of column to predict
+            max_new_tokens_per_value: Max tokens to generate per value
+            temperature: Temperature for generation
+            mi_threshold: Mutual information threshold
+            apply_final_constraints: Whether to apply constraints
+            save_path: Path to save output
         Returns:
-            pd.DataFrame: 填充缺失值后的DataFrame
+            dict: Results containing predictions and metrics
         """
         self.model.eval()
         self.selector.eval()
         
-        # 读取CSV文件
+        # Read CSV and validate target column
         df = pd.read_csv(csv_file_path)
         
-        # 检查目标列是否存在
         if target_column not in df.columns:
             raise ValueError(f"Column '{target_column}' not found in the CSV file")
         
-        # 检查目标列是否有缺失值
-        missing_mask = df[target_column].isna()
-        if not missing_mask.any():
-            print(f"No missing values found in column '{target_column}'")
-            return df
+        true_values = df[target_column].copy()
         
-        missing_count = missing_mask.sum()
-        print(f"Found {missing_count} missing values in column '{target_column}'")
+        print(f"Predicting {len(df)} samples for column '{target_column}'")
         
-        # 创建结果DataFrame的副本
         result_df = df.copy()
+        predictions = []
         
-        # 处理每个缺失值
-        for idx in tqdm(df[missing_mask].index, desc=f"Imputing missing values in {target_column}"):
-            # 获取当前行的所有非缺失值作为prefix
-            current_row = df.loc[idx]
+        # Generate predictions for each row
+        for idx in tqdm(range(len(df)), desc=f"Predicting {target_column}"):
+            current_row = df.iloc[idx]
             available_features = []
             
-            for col in self.feature_columns:
+            # Get non-null feature values
+            for col in df.columns:
                 if col != target_column and pd.notna(current_row[col]):
                     available_features.append((col, str(current_row[col])))
             
             if not available_features:
-                # 如果没有可用的特征值，随机选择一个训练数据中的值
+                # Use random training value if no features available
                 random_value = self.df[target_column].dropna().sample(1).iloc[0]
-                result_df.loc[idx, target_column] = str(random_value)
+                predictions.append(str(random_value))
                 continue
             
-            # 构建prompt，使用所有可用的特征值
+            # Build prompt with relevant features
             filtered_prefix_parts = []
             if available_features:
-                # 使用selector选择最相关的特征值
                 mi_scores = self.selector(target_column, available_features)
                 if mi_scores.numel() > 0:
                     relevant_indices = (mi_scores >= mi_threshold).nonzero(as_tuple=True)[0]
@@ -873,23 +866,19 @@ class SAGE:
                         selected_feat, selected_val = available_features[idx_score.item()]
                         filtered_prefix_parts.append(f"{selected_feat} is {selected_val}")
             
-            # 构建生成prompt
+            # Construct generation prompt
             current_generator_prompt_base = f"{target_column} is"
             if filtered_prefix_parts:
                 current_prompt_for_generator = ", ".join(filtered_prefix_parts) + ", " + current_generator_prompt_base
             else:
                 current_prompt_for_generator = current_generator_prompt_base
             
-            # 编码输入
             input_ids = self.tokenizer(current_prompt_for_generator, return_tensors='pt').input_ids.to(self.device)
             
-            # 构建LogitsProcessor列表
+            # Setup logits processors
             logits_processor_list = LogitsProcessorList()
-            
-            # 阻止逗号作为第一个token
             logits_processor_list.append(NoLeadingCommaLogitsProcessor(self.tokenizer))
             
-            # 如果是分类特征，应用合法值token约束
             if self.constrain_string_values and target_column in self.categorical_features:
                 allowed_tokens = self.valid_value_token_ids.get(target_column)
                 if allowed_tokens:
@@ -898,10 +887,9 @@ class SAGE:
                     except ValueError as e:
                         print(f"Warning: Skipping AllowedTokensLogitsProcessor for '{target_column}': {e}")
             
-            # 获取有效的最大token数
             effective_max_new_tokens = self.max_tokens_for_value.get(target_column, max_new_tokens_per_value)
             
-            # 生成缺失值
+            # Generate prediction
             output = self.model.generate(
                 input_ids,
                 max_new_tokens=effective_max_new_tokens,
@@ -914,30 +902,103 @@ class SAGE:
                 logits_processor=logits_processor_list if logits_processor_list else None
             )
             
-            # 解码生成的结果
+            # Extract generated value
             full_generated_text = self.tokenizer.decode(output[0], skip_special_tokens=True)
             new_segment = full_generated_text[len(current_prompt_for_generator):]
             generated_value = new_segment.split(",")[0].strip()
             
-            # 如果生成了空值，使用随机值填充
             if not generated_value:
                 random_value = self.df[target_column].dropna().sample(1).iloc[0]
                 generated_value = str(random_value)
             
-            # 应用约束条件（如果需要）
+            # Apply constraints if needed
             if apply_final_constraints:
-                # 创建临时的feature_value_map用于约束检查
                 temp_map = {target_column: generated_value}
                 corrected_map = self.apply_constraints(temp_map)
                 final_value = corrected_map.get(target_column, generated_value)
             else:
                 final_value = generated_value
             
-            # 填充缺失值
-            result_df.loc[idx, target_column] = final_value
+            predictions.append(final_value)
         
-        print(f"Successfully imputed {missing_count} missing values in column '{target_column}'")
-    
-        sampled_df.to_csv(save_path, index=False)
+        result_df[target_column] = predictions
+        
+        total_predictions = len(true_values)
+        
+        # Determine task type and calculate metrics
+        constraint = self.constraints.get(target_column)
+        is_numeric = constraint and constraint.get("type") == "numeric"
+        
+        if is_numeric:
+            # Calculate regression metrics
+            try:
+                true_numeric = pd.to_numeric(true_values, errors='coerce')
+                pred_numeric = pd.to_numeric(predictions, errors='coerce')
+                
+                valid_mask = ~(pd.isna(true_numeric) | pd.isna(pred_numeric))
+                true_valid = true_numeric[valid_mask]
+                pred_valid = pred_numeric[valid_mask]
+                
+                if len(true_valid) > 0:
+                    mse = np.mean((true_valid - pred_valid) ** 2)
+                    mae = np.mean(np.abs(true_valid - pred_valid))
+                    rmse = np.sqrt(mse)
+                    
+                    print(f"Regression Results:")
+                    print(f"MSE: {mse:.4f}")
+                    print(f"MAE: {mae:.4f}")
+                    print(f"RMSE: {rmse:.4f}")
+                    print(f"Valid predictions: {len(true_valid)}/{total_predictions}")
+                    
+                    results = {
+                        'predictions_df': result_df,
+                        'task_type': 'regression',
+                        'mse': mse,
+                        'mae': mae,
+                        'rmse': rmse,
+                        'valid_count': len(true_valid),
+                        'total_count': total_predictions
+                    }
+                else:
+                    print("No valid numeric predictions for regression evaluation")
+                    results = {
+                        'predictions_df': result_df,
+                        'task_type': 'regression',
+                        'error': 'No valid numeric values'
+                    }
+            except Exception as e:
+                print(f"Error in regression evaluation: {e}")
+                results = {
+                    'predictions_df': result_df,
+                    'task_type': 'regression',
+                    'error': str(e)
+                }
+        else:
+            # Calculate classification metrics
+            correct_predictions = 0
+            for true_val, pred_val in zip(true_values, predictions):
+                if str(true_val) == str(pred_val):
+                    correct_predictions += 1
+            
+            error_rate = 1 - (correct_predictions / total_predictions)
+            accuracy = correct_predictions / total_predictions
+            
+            print(f"Classification Results:")
+            print(f"Accuracy: {accuracy:.4f}")
+            print(f"Error Rate: {error_rate:.4f}")
+            print(f"Correct: {correct_predictions}/{total_predictions}")
+            
+            results = {
+                'predictions_df': result_df,
+                'task_type': 'classification',
+                'accuracy': accuracy,
+                'error_rate': error_rate,
+                'correct_count': correct_predictions,
+                'total_count': total_predictions
+            }
+        
+        # Save results
+        result_df.to_csv(save_path, index=False)
         clean_csv_in_place(save_path)
-        return result_df
+        
+        return results
