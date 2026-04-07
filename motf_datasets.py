@@ -34,7 +34,7 @@ class FeatureTextDataset(Dataset):
 
                 sep_ids = tokenizer.encode(", ", add_special_tokens=False)
                 input_ids.extend(sep_ids)
-                labels.extend(sep_ids)
+                labels.extend([-100] * len(sep_ids))
 
             input_ids = input_ids[:max_length]
             labels = labels[:max_length]

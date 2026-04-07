@@ -46,13 +46,24 @@ class NonParametricMISelector(nn.Module):
         self.mi_table = {} 
         self.feature_columns = []
         self.discretizers = None 
+        self.feature_mean_mi = {}
 
     def set_mi_data(self, mi_table, feature_columns, discretizers):
 
         self.mi_table = mi_table
         self.feature_columns = feature_columns
         self.discretizers = discretizers 
+        self.feature_mean_mi = {}
+        for (current_feature, _, _), score in mi_table.items():
+            self.feature_mean_mi.setdefault(current_feature, []).append(float(score))
+        self.feature_mean_mi = {
+            feat: (float(np.mean(scores)) if len(scores) > 0 else 0.0)
+            for feat, scores in self.feature_mean_mi.items()
+        }
         print(f"Selector MI table loaded with {len(mi_table)} entries.")
+
+    def get_feature_mean_mi(self, feature_name: str) -> float:
+        return float(self.feature_mean_mi.get(feature_name, 0.0))
 
     def forward(self, current_feature: str, past_feature_value_pairs: list[tuple[str, str]]):
         if not past_feature_value_pairs:
@@ -80,39 +91,32 @@ class NonParametricMISelector(nn.Module):
 
 
 class MiLogitsBiasProcessor(LogitsProcessor):
-    def __init__(self, tokenizer, current_feat, past_feature_value_pairs, mi_calculator, mi_bias_scale=0.1, mi_floor_bias=-1.0):
+    def __init__(self, tokenizer, current_feat, past_feature_value_pairs, mi_calculator, mi_lambda=1.0, scale_clip_min=0.5, scale_clip_max=1.5):
         self.tokenizer = tokenizer
         self.current_feat = current_feat
         self.past_feature_value_pairs = past_feature_value_pairs
         self.mi_calculator = mi_calculator
-        self.mi_bias_scale = mi_bias_scale
-        self.mi_floor_bias = mi_floor_bias
-
-        self.mi_scores = []
-        if past_feature_value_pairs:
-            self.mi_scores = self.mi_calculator(current_feat, past_feature_value_pairs)
-            mi_scores_np = np.array(self.mi_scores)
-            if mi_scores_np.size > 0:
-                mi_scores_np = (mi_scores_np - mi_scores_np.min()) / (mi_scores_np.max() - mi_scores_np.min() + 1e-6)
-                self.mi_scores = mi_scores_np.tolist()
-            else:
-                self.mi_scores = []
+        self.mi_lambda = mi_lambda
+        self.scale_clip_min = scale_clip_min
+        self.scale_clip_max = scale_clip_max
 
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
 
         assert input_ids.shape[0] == 1, "MiLogitsBiasProcessor assumes batch_size = 1"
-        
-        bias = torch.zeros_like(scores)
+        if not self.past_feature_value_pairs:
+            return scores
 
-        if self.mi_scores:
-    
-            avg_mi_score = sum(self.mi_scores) / len(self.mi_scores)
+        mi_scores = self.mi_calculator(self.current_feat, self.past_feature_value_pairs)
+        if mi_scores.numel() == 0:
+            return scores
 
-            global_bias = avg_mi_score * self.mi_bias_scale
+        mu_sample = float(mi_scores.mean().item())
+        mu_train = float(self.mi_calculator.get_feature_mean_mi(self.current_feat))
+        if mu_train <= 1e-12:
+            return scores
 
-            global_bias = max(global_bias, self.mi_floor_bias)
-            
-            bias += global_bias 
-
-        return scores + bias
+        delta = (mu_sample / mu_train) - 1.0
+        scale = 1.0 + (self.mi_lambda * delta)
+        scale = max(self.scale_clip_min, min(self.scale_clip_max, scale))
+        return scores * scale

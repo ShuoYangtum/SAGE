@@ -16,10 +16,26 @@ from Selector import NonParametricMISelector, MiLogitsBiasProcessor
 from generation import NoLeadingCommaLogitsProcessor, AllowedTokensLogitsProcessor
 from utils import clean_csv_in_place
 import re
-import Levenshtein
 from loss import FocalLoss
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import difflib
+try:
+    import Levenshtein  # type: ignore
+except ImportError:
+    Levenshtein = None
+
+
+def set_global_seed(seed: int, deterministic: bool = False):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
 
 class SAGE:
     def __init__(self, model_name="gpt2", device=None, use_lora=True):
@@ -51,15 +67,55 @@ class SAGE:
         self.constraints = None
         self.feature_columns = None
         self.numerical_min_diffs = {} 
+        self.default_mi_threshold = None
+        self.seed = None
 
-    def _discretize_dataframe(self, df, n_bins=10, strategy='quantile'):
+    def _should_pin_memory(self):
+        return str(self.device).startswith("cuda") and torch.cuda.is_available()
+
+    def _resolve_fd_bins(self, series, fallback_bins=10, max_bins=16):
+        values = pd.to_numeric(series, errors="coerce").dropna().to_numpy()
+        if values.size < 2:
+            return max(2, int(fallback_bins))
+
+        value_min = float(np.min(values))
+        value_max = float(np.max(values))
+        value_range = value_max - value_min
+        if value_range <= 0:
+            return max(2, int(fallback_bins))
+
+        q75, q25 = np.percentile(values, [75, 25])
+        iqr = float(q75 - q25)
+        if iqr <= 0:
+            return max(2, int(min(max_bins, fallback_bins)))
+
+        bin_width = 2.0 * iqr * (values.size ** (-1.0 / 3.0))
+        if bin_width <= 1e-12:
+            return max(2, int(min(max_bins, fallback_bins)))
+
+        k = int(np.ceil(value_range / bin_width))
+        return max(2, min(max_bins, k))
+
+    def _discretize_dataframe(self, df, n_bins=10, strategy='fd'):
         df_discretized = df.copy()
         discretizers = {}
         for col in df.columns:
             if pd.api.types.is_numeric_dtype(df[col]):
                 non_nan_values = df[col].dropna().values.reshape(-1, 1)
                 if len(non_nan_values) > 0:
-                    discretizer = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy=strategy, subsample=None)
+                    if strategy == "fd":
+                        bins_for_col = self._resolve_fd_bins(df[col], fallback_bins=n_bins, max_bins=16)
+                        discretizer_strategy = "uniform"
+                    else:
+                        bins_for_col = n_bins
+                        discretizer_strategy = strategy
+
+                    discretizer = KBinsDiscretizer(
+                        n_bins=bins_for_col,
+                        encode='ordinal',
+                        strategy=discretizer_strategy,
+                        subsample=None
+                    )
                     discretizer.fit(non_nan_values)
                     
                     df_discretized[col] = discretizer.transform(df[col].values.reshape(-1, 1)).astype(int).flatten()
@@ -110,8 +166,11 @@ class SAGE:
 
     def fit(self, data, epochs=10, batch_size=8, lr=1e-3, max_length=256,
             val_ratio=0.05, early_stopping_rounds=5, mi_n_bins=10,
-            mi_strategy='quantile', mi_threshold=0.01, constrain_string_values=False,
-            num_workers=4, gradient_accumulation_steps=4, max_sample_num=None, shuffle=False, drop=None):
+            mi_strategy='fd', mi_threshold=None, constrain_string_values=False,
+            num_workers=4, gradient_accumulation_steps=4, max_sample_num=None, shuffle=False, drop=None,
+            seed=42, deterministic=False, checkpoint_path="best_generator_model.pt", load_best_at_end=True):
+        self.seed = seed
+        set_global_seed(seed=seed, deterministic=deterministic)
         df = pd.read_csv(data)
         df = df.fillna(-100)
         #df=df.dropna()
@@ -175,12 +234,21 @@ class SAGE:
         df_discretized, self.discretizers = self._discretize_dataframe(df, n_bins=mi_n_bins, strategy=mi_strategy)
      
         mi_table = self._calculate_all_mutual_info(df, df_discretized, self.feature_columns)
+        all_mi_scores = list(mi_table.values())
+        self.default_mi_threshold = float(np.median(all_mi_scores)) if all_mi_scores else 0.0
+        effective_mi_threshold = self.default_mi_threshold if mi_threshold is None else mi_threshold
        
         self.selector.set_mi_data(mi_table, self.feature_columns, self.discretizers)
 
-        train_df, val_df = train_test_split(df, test_size=val_ratio, random_state=42)
+        train_df, val_df = train_test_split(df, test_size=val_ratio, random_state=seed)
         train_dataset = FeatureTextDataset(train_df, self.tokenizer, max_length=max_length)
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=self._should_pin_memory(),
+        )
         optimizer = AdamW(self.model.parameters(), lr=lr)
         best_val_loss = float('inf')
         no_improve_epochs = 0
@@ -189,7 +257,13 @@ class SAGE:
             total_train_loss_generator = 0
             if shuffle:
                 train_dataset = FeatureTextDataset(train_df, self.tokenizer, max_length=max_length)
-                train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+                train_loader = DataLoader(
+                    train_dataset,
+                    batch_size=batch_size,
+                    shuffle=True,
+                    num_workers=num_workers,
+                    pin_memory=self._should_pin_memory(),
+                )
             for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1} (Generator Training)")):
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
@@ -240,7 +314,7 @@ class SAGE:
                             mi_scores = self.selector(current_feat, current_history_fv)
                             selected_past_fv_texts = []
                             if mi_scores.numel() > 0:
-                                relevant_indices = (mi_scores >= mi_threshold).nonzero(as_tuple=True)[0]
+                                relevant_indices = (mi_scores >= effective_mi_threshold).nonzero(as_tuple=True)[0]
                                 for idx in relevant_indices:
                                     selected_feat, selected_val = current_history_fv[idx.item()]
                                     selected_past_fv_texts.append(f"{selected_feat} is {selected_val}")
@@ -274,13 +348,17 @@ class SAGE:
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 no_improve_epochs = 0
-                torch.save(self.model.state_dict(), "best_generator_model.pt")
+                torch.save(self.model.state_dict(), checkpoint_path)
             else:
                 no_improve_epochs += 1
                 if no_improve_epochs >= early_stopping_rounds:
                     print(f"Early stopping at epoch {epoch + 1}")
                     break
-        self.model.load_state_dict(torch.load("best_generator_model.pt"))
+        if load_best_at_end:
+            if os.path.exists(checkpoint_path):
+                self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
+            else:
+                print(f"Warning: checkpoint '{checkpoint_path}' not found. Keeping current model weights.")
 
     def _cosine_annealing(self, current_step, total_steps, start_value, end_value):
         if current_step > 5:
@@ -294,15 +372,17 @@ class SAGE:
         return annealed_value
 
 
-    def sample(self, sample_num=1, feature_order=None, p=0.5, max_new_tokens_per_value=20, temperature=1.0, mi_threshold=0.01,
+    def sample(self, sample_num=1, feature_order=None, p=0.5, max_new_tokens_per_value=20, temperature=1.0, mi_threshold=None,
                copy_factor=3, copy_prob_start=1.0, copy_prob_end=0.0, apply_final_constraints=True):
+        if copy_factor < 1:
+            raise ValueError("copy_factor must be >= 1.")
         self.model.eval()
         self.selector.eval()
-        constrain_string_values=self.constrain_string_values 
         samples = []
         generated_full_samples_set = set()
         current_incomplete_samples = []
-        for _ in range(sample_num//copy_factor):
+        initial_seed_samples = max(1, sample_num // copy_factor)
+        for _ in range(initial_seed_samples):
             if feature_order is None:
                 initial_order = self.feature_columns.copy()
                 random.shuffle(initial_order)
@@ -318,7 +398,7 @@ class SAGE:
                 'past_feature_value_pairs': predefined_pairs,
                 'current_feature_order': initial_order
             })
-        num_features = len(initial_order)
+        num_features = len(self.feature_columns)
         while len(generated_full_samples_set) < sample_num and current_incomplete_samples:
             temp_samples_to_process = current_incomplete_samples
             current_incomplete_samples = []
@@ -347,7 +427,8 @@ class SAGE:
                 if past_feature_value_pairs:
                     mi_scores = self.selector(current_feat, past_feature_value_pairs)
                     if mi_scores.numel() > 0:
-                        relevant_indices = (mi_scores >= mi_threshold).nonzero(as_tuple=True)[0]
+                        threshold = self.default_mi_threshold if mi_threshold is None else mi_threshold
+                        relevant_indices = (mi_scores >= threshold).nonzero(as_tuple=True)[0]
                         for idx in relevant_indices:
                             selected_feat, selected_val = past_feature_value_pairs[idx.item()]
                             filtered_prefix_parts.append(f"{selected_feat} is {selected_val}")
@@ -358,10 +439,16 @@ class SAGE:
                     current_prompt_for_generator = current_generator_prompt_base
                 input_ids = self.tokenizer(current_prompt_for_generator, return_tensors='pt').input_ids.to(self.device)
                 logits_processor_list = LogitsProcessorList()
+                logits_processor_list.append(NoLeadingCommaLogitsProcessor(self.tokenizer))
+                if self.constrain_string_values and current_feat in self.valid_value_token_ids:
+                    allowed_tokens = self.valid_value_token_ids.get(current_feat)
+                    if allowed_tokens:
+                        logits_processor_list.append(AllowedTokensLogitsProcessor(allowed_tokens))
                 effective_max_new_tokens = self.max_tokens_for_value.get(current_feat, max_new_tokens_per_value)
  
                 output = self.model.generate(
                     input_ids,
+                    attention_mask=torch.ones_like(input_ids),
                     max_new_tokens=effective_max_new_tokens,
                     do_sample=True,
                     temperature=temperature,
@@ -381,7 +468,7 @@ class SAGE:
                     'feature_value_map': new_feature_value_map,
                     'past_feature_value_pairs': new_past_feature_value_pairs,
                     'current_feature_order': current_feature_order})
-                if copy_factor<=1:
+                if copy_factor > 1:
                     if num_features > 1:
                         annealed_copy_prob = self._cosine_annealing(
                             current_step=feat_idx,
@@ -423,8 +510,10 @@ class SAGE:
             samples = random.sample(samples, sample_num)
         tmp_df=pd.DataFrame(samples)
         dict_list = tmp_df.to_dict(orient='records')
-        output=[self.apply_constraints(dict_list[i]) for i in range(sample_num)]
-        return pd.DataFrame(output)
+        if apply_final_constraints:
+            output = [self.apply_constraints(dict_list[i]) for i in range(min(sample_num, len(dict_list)))]
+            return pd.DataFrame(output)
+        return tmp_df.head(sample_num)
 
     
     def analyze_constraints(self, df, numeric_threshold=30):
@@ -473,8 +562,10 @@ class SAGE:
         self.feature_columns = list(columns)
 
     def _levenshtein_distance(self, s1, s2):
-        # Using Levenshtein from the library directly as imported
-        return Levenshtein.distance(s1, s2)
+        if Levenshtein is not None:
+            return Levenshtein.distance(s1, s2)
+        # Fallback distance proxy when python-Levenshtein is unavailable.
+        return int((1.0 - difflib.SequenceMatcher(None, s1, s2).ratio()) * max(len(s1), len(s2)))
 
     def apply_constraints(self, generated_data):
         corrected_data = {}
@@ -579,7 +670,7 @@ class SAGE:
                 else:
                     corrected_data[feature] = gen_value_str
         return corrected_data
-    def sample_attn(self, sample_num=1, feature_order=None, p=0.5, max_new_tokens_per_value=20, temperature=1.0, mi_threshold=0.01, apply_final_constraints=True):
+    def sample_attn(self, sample_num=1, feature_order=None, p=0.5, max_new_tokens_per_value=20, temperature=1.0, mi_threshold=None, apply_final_constraints=True):
         self.model.eval()
         self.selector.eval()
         
@@ -621,7 +712,8 @@ class SAGE:
                             prompt_input_ids.extend(token_ids_part)
                             prompt_input_ids.extend(token_ids_part2)
 
-                            is_relevant = mi_scores[idx] >= mi_threshold
+                            threshold = self.default_mi_threshold if mi_threshold is None else mi_threshold
+                            is_relevant = mi_scores[idx] >= threshold
                             if is_relevant:
                                 prompt_attention_mask.extend([1] * len(token_ids_part))
                                 prompt_attention_mask.extend([1] * len(token_ids_part2))
@@ -650,6 +742,10 @@ class SAGE:
 
                     logits_processor_list = LogitsProcessorList()
                     logits_processor_list.append(NoLeadingCommaLogitsProcessor(self.tokenizer))
+                    if self.constrain_string_values and current_feat in self.valid_value_token_ids:
+                        allowed_tokens = self.valid_value_token_ids.get(current_feat)
+                        if allowed_tokens:
+                            logits_processor_list.append(AllowedTokensLogitsProcessor(allowed_tokens))
                     
                     effective_max_new_tokens = self.max_tokens_for_value.get(current_feat, max_new_tokens_per_value)
 
@@ -693,7 +789,7 @@ class SAGE:
         
         return result_df[self.feature_columns]
 
-    def sample_logits(self, sample_num=1, feature_order=None, p=0.5, max_new_tokens_per_value=20, temperature=1.0, mi_bias_scale=0.1, mi_floor_bias=-1.0, apply_final_constraints=True):
+    def sample_logits(self, sample_num=1, feature_order=None, p=0.5, max_new_tokens_per_value=20, temperature=1.0, mi_lambda=1.0, scale_clip_min=0.5, scale_clip_max=1.5, apply_final_constraints=True):
 
         self.model.eval()
         self.selector.eval() 
@@ -748,6 +844,10 @@ class SAGE:
                         
                         logits_processor_list = LogitsProcessorList()
                         logits_processor_list.append(NoLeadingCommaLogitsProcessor(self.tokenizer)) 
+                        if self.constrain_string_values and current_feat in self.valid_value_token_ids:
+                            allowed_tokens = self.valid_value_token_ids.get(current_feat)
+                            if allowed_tokens:
+                                logits_processor_list.append(AllowedTokensLogitsProcessor(allowed_tokens))
                         
                         if past_feature_value_pairs: 
                             logits_processor_list.append(
@@ -756,8 +856,9 @@ class SAGE:
                                     current_feat=current_feat,
                                     past_feature_value_pairs=past_feature_value_pairs,
                                     mi_calculator=self.selector,
-                                    mi_bias_scale=mi_bias_scale,
-                                    mi_floor_bias=mi_floor_bias
+                                    mi_lambda=mi_lambda,
+                                    scale_clip_min=scale_clip_min,
+                                    scale_clip_max=scale_clip_max
                                 )
                             )
                         
@@ -793,8 +894,9 @@ class SAGE:
                         final_samples.append(corrected_sample)
                     else:
                         final_samples.append(feature_value_map)
-                except:
-                    pass
+                except Exception as exc:
+                    print(f"Warning: sample generation failed for one instance: {exc}")
+                    continue
         
         if not final_samples:
             return pd.DataFrame()
@@ -808,7 +910,7 @@ class SAGE:
 
     def imputation(self, csv_file_path, target_column, \
                    max_new_tokens_per_value=20, temperature=1.0, \
-                   mi_threshold=0.01, apply_final_constraints=True,\
+                   mi_threshold=None, apply_final_constraints=True,\
                    save_path = '../output.csv'):
         """
         Predict values for target column in CSV file and calculate error metrics.
@@ -861,7 +963,8 @@ class SAGE:
             if available_features:
                 mi_scores = self.selector(target_column, available_features)
                 if mi_scores.numel() > 0:
-                    relevant_indices = (mi_scores >= mi_threshold).nonzero(as_tuple=True)[0]
+                    threshold = self.default_mi_threshold if mi_threshold is None else mi_threshold
+                    relevant_indices = (mi_scores >= threshold).nonzero(as_tuple=True)[0]
                     for idx_score in relevant_indices:
                         selected_feat, selected_val = available_features[idx_score.item()]
                         filtered_prefix_parts.append(f"{selected_feat} is {selected_val}")
@@ -892,6 +995,7 @@ class SAGE:
             # Generate prediction
             output = self.model.generate(
                 input_ids,
+                attention_mask=torch.ones_like(input_ids),
                 max_new_tokens=effective_max_new_tokens,
                 do_sample=True,
                 temperature=temperature,

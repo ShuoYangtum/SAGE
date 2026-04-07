@@ -1,49 +1,105 @@
-import random
-import pandas as pd
+import argparse
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM, LogitsProcessorList
-from torch.optim import AdamW
-from tqdm import tqdm
-from peft import get_peft_model, LoraConfig, TaskType
-from sklearn.model_selection import train_test_split
-from sklearn.feature_selection import mutual_info_classif
-from sklearn.preprocessing import KBinsDiscretizer, OneHotEncoder
-import numpy as np
-from motf_datasets import FeatureTextDataset
-from Selector import NonParametricMISelector, MiLogitsBiasProcessor
-from generation import NoLeadingCommaLogitsProcessor, AllowedTokensLogitsProcessor
-from utils import clean_csv_in_place
-import re
-import Levenshtein
-from loss import FocalLoss
-import os
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import time
 from sage import SAGE
 
 
+def build_parser():
+    parser = argparse.ArgumentParser(description="Train SAGE and run column imputation.")
+    parser.add_argument("--target-column", type=str, required=True, help="Column to impute in test CSV.")
+    parser.add_argument("--train-path", type=str, default="train.csv", help="Training CSV path.")
+    parser.add_argument("--test-path", type=str, default="test.csv", help="Test CSV path.")
+    parser.add_argument("--output-path", type=str, default="../output.csv", help="Output CSV path.")
+    parser.add_argument("--model-name", type=str, default="gpt2", help="HF model name.")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Torch device, e.g. cuda:0 or cpu.")
+    parser.add_argument("--use-lora", action="store_true", help="Enable LoRA fine-tuning.")
+    parser.add_argument("--seed", type=int, default=42, help="Global random seed.")
+    parser.add_argument("--deterministic", action="store_true", help="Enable deterministic torch backend for reproducibility.")
+    parser.add_argument("--checkpoint-path", type=str, default="best_generator_model.pt", help="Path to save best model checkpoint.")
+
+    # Fit arguments
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--max-length", type=int, default=50)
+    parser.add_argument("--val-ratio", type=float, default=0.001)
+    parser.add_argument("--early-stopping-rounds", type=int, default=5)
+    parser.add_argument("--mi-n-bins", type=int, default=10)
+    parser.add_argument(
+        "--mi-strategy",
+        type=str,
+        default="fd",
+        choices=["fd", "quantile", "uniform", "kmeans"],
+        help="Discretization strategy for MI preprocessing. 'fd' follows paper default."
+    )
+    parser.add_argument(
+        "--mi-threshold",
+        type=float,
+        default=None,
+        help="MI threshold for selecting relevant context. If omitted, use median MI from training set."
+    )
+    parser.add_argument("--constrain-string-values", action="store_true")
+    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--max-sample-num", type=int, default=None)
+    parser.add_argument("--shuffle", action="store_true")
+    parser.add_argument(
+        "--drop-columns",
+        type=str,
+        default="",
+        help="Comma-separated columns to drop before training."
+    )
+
+    # Imputation arguments
+    parser.add_argument("--max-new-tokens-per-value", type=int, default=20)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--disable-final-constraints", action="store_true")
+    return parser
+
+
 def main():
-    target_column=""
-    train_pth="train.csv"
-    test_pth='test.csv'
-    device=torch.device("cuda:0")
+    args = build_parser().parse_args()
+    device = torch.device(args.device)
     
-    generator = SAGE(model_name="gpt2", device=device, use_lora=False) #Qwen/Qwen3-0.6B-Base meta-llama/Llama-3.2-1B
-    mi_threshold=0.0001 
-    a=time.time()
-    generator.fit(train_pth, max_sample_num=None,\
-                    batch_size=32, epochs=100, lr=1e-4, max_length=50, shuffle=True,\
-                    early_stopping_rounds=5, mi_threshold=mi_threshold, mi_n_bins=5,\
-                    constrain_string_values=True, val_ratio=0.001, num_workers=8, gradient_accumulation_steps=1, drop=[])
+    drop_columns = [c.strip() for c in args.drop_columns.split(",") if c.strip()]
+    apply_final_constraints = not args.disable_final_constraints
+
+    generator = SAGE(model_name=args.model_name, device=device, use_lora=args.use_lora) # Qwen/Qwen3-0.6B-Base meta-llama/Llama-3.2-1B
+    a = time.time()
+    generator.fit(
+        args.train_path,
+        max_sample_num=args.max_sample_num,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+        max_length=args.max_length,
+        shuffle=args.shuffle,
+        early_stopping_rounds=args.early_stopping_rounds,
+        mi_threshold=args.mi_threshold,
+        mi_n_bins=args.mi_n_bins,
+        mi_strategy=args.mi_strategy,
+        constrain_string_values=args.constrain_string_values,
+        val_ratio=args.val_ratio,
+        num_workers=args.num_workers,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        drop=drop_columns,
+        seed=args.seed,
+        deterministic=args.deterministic,
+        checkpoint_path=args.checkpoint_path,
+        load_best_at_end=True
+    )
 
     # generator.model.load_state_dict(torch.load("best_generator_model.pt")) 
 
-    result = generator.imputation(test_pth, target_column, \
-                       max_new_tokens_per_value=20, temperature=1.0, \
-                       mi_threshold=0.0001, apply_final_constraints=True,\
-                       save_path = '../output.csv')
+    result = generator.imputation(
+        args.test_path,
+        args.target_column,
+        max_new_tokens_per_value=args.max_new_tokens_per_value,
+        temperature=args.temperature,
+        mi_threshold=args.mi_threshold,
+        apply_final_constraints=apply_final_constraints,
+        save_path=args.output_path
+    )
 
     # Print training time and results
     training_time = time.time() - a
